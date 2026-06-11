@@ -1,0 +1,13 @@
+# Large data/model files
+*.pth
+*.pkl
+corpus*.txt
+kn_model*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Results (generated)
+result_*.txt

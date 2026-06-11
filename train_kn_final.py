@@ -1,16 +1,17 @@
 import collections
 import json
-import math
 import sys
 import io
 import os
-from jamo import h2j, j2hcj
 
 # Force UTF-8
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if not isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+from crack import decompose
 
 def get_jamo_sequence(text):
-    return j2hcj(h2j(text))
+    return decompose(text)
 
 class KneserNeyLM:
     def __init__(self, order=7, discount=0.75):

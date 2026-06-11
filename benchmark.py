@@ -8,16 +8,17 @@ import json
 import random
 import sys
 import io
-from jamo import h2j, j2hcj
 
 if not isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+from crack import decompose
 
 JAMO_POOL = [chr(i) for i in range(0x3131, 0x3164)]
 
 
 def get_jamo_sequence(text):
-    return j2hcj(h2j(text))
+    return decompose(text)
 
 
 def build(corpus_path="corpus.txt", out_path="benchmark_set.json",

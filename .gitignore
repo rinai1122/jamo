@@ -9,5 +9,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Results (generated)
+# Results (generated). The two runs behind the README headline table
+# (ns_result_baseline.json, ns_result_v3.json) are committed explicitly; all
+# other ns_eval outputs are regenerable and stay untracked.
 result_*.txt
+ns_result_*.json
+!ns_result_baseline.json
+!ns_result_v3.json

@@ -8,8 +8,10 @@ identical params (seed 7001, 100 fragments, 30–200 jamo): one drawn from
 train lines, one from test lines.  The same train-built solver is run
 against both, so the only difference is data leakage.
 
-Reproduce: `python cv_setup.py && python run_experiments.py`
-(continuation: `run_experiments2.py`; no-space detail: `run_nospace.py`).
+Reproduce the no-space study (§3–4): `python cv_setup.py && python ns_eval.py`
+— see `README.md`. The spaced-solver leakage/ablation scripts behind §1–2
+(`run_experiments.py`, `run_experiments2.py`, `cv_eval.py`) and the earlier
+diagnostics now live under `archive/` (run them from the repo root).
 
 ## 1. Leakage test — is the benchmark cheating?
 

@@ -140,6 +140,15 @@ class KneserNeyScorer:
         self.unique_follows = [collections.Counter(c) for c in data["unique_follows"]]
         self.total_unigrams = sum(self.counts[1].values())
         self._cache: dict[str, float] = {}
+        # The cache is pure memoization (never affects results), but it would
+        # otherwise grow without bound: a long solve scores millions of distinct
+        # n-grams (every position of every decryption the search explores), and
+        # a multiprocessing worker reuses one scorer across many cases.  Left
+        # uncapped this exhausts RAM and the box swaps to a crawl, then OOMs.
+        # Cap the size and drop the cache wholesale when it is hit -- cheaper
+        # than per-entry LRU bookkeeping and the within-case hit rate recovers
+        # almost immediately.
+        self._cache_cap = 1_000_000
 
     def log_prob(self, sequence: str) -> float:
         """Sum of log₁₀ P(jamo_i | context) for every position."""
@@ -168,6 +177,8 @@ class KneserNeyScorer:
                 p   = max(p, 1e-12)
             else:
                 p = self._prob(ngram[1:])
+        if len(self._cache) >= self._cache_cap:
+            self._cache.clear()
         self._cache[ngram] = p
         return p
 
@@ -257,10 +268,16 @@ class BeamSolver:
     """
 
     def __init__(self, kn_model_path: str = "kn_model.json",
-                 corpus_path: str = "corpus.txt"):
+                 corpus_path: str = "corpus.txt",
+                 disable: set = None,
+                 pattern_map_cache: str = _PATTERN_MAP_CACHE):
+        # `disable` names stages/terms to switch off (for ablation studies):
+        #   "kn", "struct", "dict", "beam", "edge", "sa_fallback",
+        #   "sa_polish", "greedy".  Empty set = full pipeline (default).
+        self.disable      = disable or set()
         self.scorer       = KneserNeyScorer(kn_model_path)
         self.target_jamos = self.scorer.jamos_by_freq   # most-frequent first
-        self.pattern_map, total = _build_pattern_map(corpus_path)
+        self.pattern_map, total = _build_pattern_map(corpus_path, pattern_map_cache)
         self.log_total = math.log10(total)
         # Flat list sorted by count — used for edge-word truncation matching.
         self._all_words = sorted(
@@ -271,11 +288,13 @@ class BeamSolver:
     # ── fitness ──────────────────────────────────────────────────────────────
 
     def _fitness(self, text: str, word_cands: list) -> float:
-        score  = self.scorer.log_prob(text)
-        score -= STRUCT_PENALTY * structure_violations(text)
-        for word, cands in zip(text.split(" "), word_cands):
-            if cands and word in cands:
-                score += DICT_BONUS * len(word)
+        score = 0.0 if "kn" in self.disable else self.scorer.log_prob(text)
+        if "struct" not in self.disable:
+            score -= STRUCT_PENALTY * structure_violations(text)
+        if "dict" not in self.disable:
+            for word, cands in zip(text.split(" "), word_cands):
+                if cands and word in cands:
+                    score += DICT_BONUS * len(word)
         return score
 
     # ── beam search ──────────────────────────────────────────────────────────
@@ -571,9 +590,12 @@ class BeamSolver:
         rng = random.Random(0)
 
         # ── 1. Beam search ────────────────────────────────────────────────────
-        scored = self._rerank(
-            self._beam(cipher_words), symbols, cipher_counts, ciphertext, word_cands
-        )
+        if "beam" in self.disable:
+            scored = []   # force the SA fallback path below (no word anchors)
+        else:
+            scored = self._rerank(
+                self._beam(cipher_words), symbols, cipher_counts, ciphertext, word_cands
+            )
         if not scored:
             # No usable words (very short / space-less input): fall back to SA.
             m, _ = self._sa_solve(ciphertext, word_cands, restarts=20, iters=5000,
@@ -585,7 +607,7 @@ class BeamSolver:
         cov = coverage(best_m)
 
         # ── 2. Edge augment (retry if fragment words may be cut mid-word) ─────
-        if cov < 0.95:
+        if cov < 0.95 and "edge" not in self.disable:
             scored2 = self._rerank(
                 self._beam(cipher_words, edge_augment=True),
                 symbols, cipher_counts, ciphertext, word_cands,
@@ -599,7 +621,7 @@ class BeamSolver:
             print(f"  beam: fitness={best_f:.1f}  coverage={cov:.0%}")
 
         # ── 3. Full SA fallback (nearly nothing matched → word anchors useless) ─
-        if cov < 0.3:
+        if cov < 0.3 and "sa_fallback" not in self.disable:
             sa_m, sa_f = self._sa_solve(ciphertext, word_cands,
                                         restarts=20, iters=5000, T_init=3.0)
             if sa_f > best_f:
@@ -607,7 +629,8 @@ class BeamSolver:
                 best_f = sa_f
 
         # ── 4. Beam-seeded SA polish (when coverage is still shaky) ──────────
-        if cov < 0.85 or structure_violations(decrypt(best_m)) > 0:
+        if ("sa_polish" not in self.disable
+                and (cov < 0.85 or structure_violations(decrypt(best_m)) > 0)):
             sa_m, sa_f = self._sa_solve(
                 ciphertext, word_cands,
                 restarts=SA_RESTARTS, iters=SA_ITERS,
@@ -617,7 +640,8 @@ class BeamSolver:
                 best_m, best_f = sa_m, sa_f
 
         # ── 5. Greedy polish ──────────────────────────────────────────────────
-        best_m, _ = self._greedy_polish(best_m, symbols, ciphertext, word_cands)
+        if "greedy" not in self.disable:
+            best_m, _ = self._greedy_polish(best_m, symbols, ciphertext, word_cands)
         return decrypt(best_m)
 
 

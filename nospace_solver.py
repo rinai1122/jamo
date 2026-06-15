@@ -21,18 +21,22 @@ failure (a wrong key genuinely out-scores the truth) splits the problem cleanly:
 Search stages, all scored by the same fitness with "best by fitness wins":
 
   * LM-beam  — n-gram beam decipherment (Nuhn et al. 2013): deterministic beam
-               search over the key.  We keep the *top-K* beam keys (not just #1)
-               as seeds; each is greedy-polished.
-  * Base SA  — simulated annealing seeded by beam key #1 (the proven baseline).
+               search over the key.  The single best beam key is greedy-polished
+               and seeds the annealing ensemble.
   * Ensemble — for len >= `min_ensemble_len`, a multi-pass union of independent
-               annealers.  Pass 1 is a *deep* anneal seeded exactly as the old
-               single union pass: it protects cases that need anneal depth (the
-               ones a breadth-only redistribution was found to wreck).  Passes
-               2+ are *broad* -- shorter anneals, fresh RNGs, seeded across the
-               whole top-K beam -- cheap restarts that rescue the stuck basins.
-               Applied across ALL lengths (long cases need it most), not just
-               short ones.  Best-by-fitness over the union dominates any single
-               pass, so the ensemble never regresses a case the deep pass solved.
+               annealers seeded by the polished beam key.  Pass 1 is a *deep*
+               anneal that protects cases needing anneal depth (the ones a
+               breadth-only redistribution was found to wreck).  Passes 2+ are
+               *broad* -- shorter anneals with fresh RNGs -- cheap restarts that
+               rescue the stuck search-failure basins.  Applied across ALL
+               lengths (long cases need it most), not just short ones.
+               Best-by-fitness over the union dominates any single pass, so the
+               ensemble never regresses a case the deep pass solved.
+
+The standalone base-SA pass and the multi-seed beam (top-K seeds) of the earlier
+"v3" config were dropped after the per-stage ablation (archive/ns_ablation.py,
+SUMMARY_CV.md §5) showed base-SA fully redundant with the ensemble's deep pass 1
+and the multi-seed beam not earning its budget.
 
 Why this is safe: the search only ever *adds* candidates judged by one fitness,
 so it is monotone in fitness.  For search failures (the bulk) higher fitness
@@ -62,21 +66,17 @@ class NoSpaceSolver:
                  ext_order: str = "first", struct_penalty: float = STRUCT_PENALTY,
                  sa_restarts: int = 12, sa_iters: int = 4000, use_sa: bool = True,
                  ws_weight: float = WS_WEIGHT, word_penalty: float = 0.0,
-                 beam_seeds: int = 10,
                  short_len: int = 100000, short_sa_mult: int = 3,
                  short_iter_mult: int = 1,
                  short_sa_passes: int = 3, min_ensemble_len: int = 28,
-                 union_seed_all: bool = True, disable: set = None,
+                 disable: set = None,
                  pattern_map_path: str = "full_pattern_map_cv.pkl"):
         # `disable` names pipeline stages / fitness terms to switch off, for the
-        # ablation study (see ns_ablation.py).  Recognised: "kn", "struct", "ws"
-        # (fitness terms); "beam" (LM-beam seeding), "greedy" (greedy polish),
-        # "base_sa" (the standalone base SA pass), "ensemble" (the multi-pass
-        # union).  Empty set (default) = full pipeline, behaviour-identical.
+        # ablation study (see archive/ns_ablation.py).  Recognised: "kn",
+        # "struct", "ws" (fitness terms); "beam" (LM-beam seeding), "greedy"
+        # (greedy polish), "ensemble" (the multi-pass annealing union).  Empty
+        # set (default) = full pipeline, behaviour-identical.
         self.disable        = disable or set()
-        # Defaults below are the tuned "v3" configuration validated on the full
-        # 100-case held-out test set: +5.0 pts average / +10 solved over the
-        # original single-deep-pass solver (68.1% -> 73.1%, 47 -> 57 solved).
         # `short_len` is effectively unbounded (100000): the multi-pass ensemble
         # applies to every case of length >= `min_ensemble_len`, because the long
         # cases turned out to need it most -- they are not "already solved".
@@ -96,7 +96,6 @@ class NoSpaceSolver:
         # true key resolves into fewer, longer words.  At 0.0 (default) the term
         # is inert and the objective is unchanged.
         self.word_penalty   = word_penalty
-        self.beam_seeds     = max(1, beam_seeds)
         self.short_len      = short_len
         self.short_sa_mult  = short_sa_mult
         # Iteration budget per restart in the union passes.  Decoupled from the
@@ -108,7 +107,6 @@ class NoSpaceSolver:
         self.short_iter_mult = short_sa_mult if short_iter_mult is None else short_iter_mult
         self.short_sa_passes = max(1, short_sa_passes)
         self.min_ensemble_len = min_ensemble_len
-        self.union_seed_all = union_seed_all
         self.plain_pool     = self.scorer.jamos_by_freq   # ~51 jamo
         self._load_word_logp(pattern_map_path) if ws_weight else None
 
@@ -218,14 +216,13 @@ class NoSpaceSolver:
         return steps
 
     # ── LM-beam decipherment ─────────────────────────────────────────────
-    def _lm_beam(self, text: str, topk: int = 1) -> list:
-        """Return the `topk` best keys from the n-gram beam (best first).
+    def _lm_beam(self, text: str) -> dict:
+        """Return the single best key from the n-gram beam (or {} if empty).
 
-        The beam already carries thousands of diverse partial-key hypotheses;
-        the single best is usually right but on under-determined short cases
-        the true basin sits a little lower.  Handing the top few keys to the
-        downstream greedy/SA stages as seeds turns those near-misses into hits
-        at negligible cost.
+        Deterministic beam search over the key (Nuhn et al. 2013); the winning
+        key seeds the greedy polish and the annealing ensemble.  (An earlier
+        config also kept the top-K runners-up as extra seeds; the §5 ablation
+        found they did not earn their budget, so only the best key is used.)
         """
         sym_order = self._extension_order(text)
         rank  = {c: k for k, c in enumerate(sym_order)}
@@ -249,7 +246,7 @@ class NoSpaceSolver:
                     if cur is None or score + add > cur[0]:
                         nxt[dk] = (score + add, nm, used | {p})
             beam = sorted(nxt.values(), key=lambda h: -h[0])[:self.beam_width]
-        return [h[1] for h in beam[:topk]]
+        return beam[0][1] if beam else {}
 
     # ── greedy polish (struct-aware) ─────────────────────────────────────
     def _greedy(self, mapping, text, symbols):
@@ -351,7 +348,6 @@ class NoSpaceSolver:
         if not text:
             return ciphertext
         symbols = sorted(set(text))
-        rng = random.Random(0)
 
         def polish(m):
             # Greedy polish, unless ablated; returns (mapping, fitness).
@@ -359,45 +355,28 @@ class NoSpaceSolver:
                 return m, self._fitness(self._decrypt(m, text))
             return self._greedy(m, text, symbols)
 
-        # Incumbent: greedy-polish every top-K beam key, keep the best.  The #1
-        # key is the old incumbent, so this can only improve on it — on under-
-        # determined short cases the true basin sits just below the beam optimum
-        # and is reachable from a lower-ranked beam key the old code discarded.
-        beam_keys = [] if "beam" in self.disable else self._lm_beam(text, topk=self.beam_seeds)
+        # Incumbent: greedy-polish the best beam key.
+        beam_key = {} if "beam" in self.disable else self._lm_beam(text)
         best_m, best_f = None, -math.inf
-        for bk in beam_keys:
-            gm, gf = polish(bk)
-            if gf > best_f:
-                best_m, best_f = gm, gf
-        # SA seed: beam key #1 when available, else freq-rank restarts only.
-        sa_seed = [beam_keys[0]] if beam_keys else []
-
-        if self.use_sa and "base_sa" not in self.disable:
-            # Baseline SA, seeded by the #1 beam key (the proven baseline); never
-            # regresses the beam incumbent because of best-by-fitness.
-            sm, sf = self._sa(text, symbols, sa_seed, rng)
-            sm, sf = polish(sm)
-            if sf > best_f:
-                best_f, best_m = sf, sm
+        if beam_key:
+            best_m, best_f = polish(beam_key)
+        # SA seed: the beam key when available, else freq-rank restarts only.
+        sa_seed = [beam_key] if beam_key else []
 
         # Multi-pass SA ensemble: independent annealers, best-by-fitness over the
-        # union.  Pass 1 is a *deep* anneal (beam key #1, full iter budget, RNG(1))
-        # that protects cases needing anneal depth; passes 2+ are *broad* (shorter
-        # anneals, fresh RNGs, seeded across the whole top-K beam) that rescue the
-        # stuck search-failure basins.  Gated to len >= min_ensemble_len: below
-        # that the objective is unreliable, so extra search locks onto a
-        # higher-fitness WRONG key and accuracy drops.
+        # union.  Pass 1 is a *deep* anneal (beam-key seed, full iter budget,
+        # RNG(1)) that protects cases needing anneal depth; passes 2+ are *broad*
+        # (shorter anneals, fresh RNGs) that rescue the stuck search-failure
+        # basins.  Gated to len >= min_ensemble_len: below that the objective is
+        # unreliable, so extra search locks onto a higher-fitness WRONG key and
+        # accuracy drops.
         if (self.use_sa and "ensemble" not in self.disable
                 and len(text) < self.short_len and self.short_sa_mult > 1):
             passes = (self.short_sa_passes
                       if len(text) >= self.min_ensemble_len else 1)
             for seed in range(1, passes + 1):
-                if seed == 1:
-                    elites, pass_mult = sa_seed, self.short_sa_mult
-                else:
-                    elites = beam_keys if (self.union_seed_all and beam_keys) else sa_seed
-                    pass_mult = self.short_iter_mult
-                sm, sf = self._sa(text, symbols, elites, random.Random(seed),
+                pass_mult = self.short_sa_mult if seed == 1 else self.short_iter_mult
+                sm, sf = self._sa(text, symbols, sa_seed, random.Random(seed),
                                   restarts=self.sa_restarts * self.short_sa_mult,
                                   iters=self.sa_iters * pass_mult)
                 sm, sf = polish(sm)

@@ -10,6 +10,11 @@ up one level.
   project-phase writeups (pre-CV study).
 - `run_experiments.py`, `run_experiments2.py`, `cv_eval.py` — the spaced-solver
   cross-validation leakage + ablation study behind `SUMMARY_CV.md` §1–2.
+- `ns_ablation.py`, `ns_ablation.json` — the no-space per-stage ablation behind
+  `SUMMARY_CV.md` §5. It drove dropping the standalone base-SA pass and the
+  multi-seed beam from `NoSpaceSolver`; it references those removed knobs
+  (`beam_seeds`, `disable={"base_sa"}`), so it is frozen as a record of that
+  decision and no longer runs against the current solver.
 - `run_nospace.py`, `bench_nospace.py` — first no-space evaluators, superseded
   by the parallel `ns_eval.py`.
 - `exp_search.py`, `exp_validate.py`, `exp_ws.py` — one-off no-space tuning

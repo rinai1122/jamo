@@ -9,10 +9,13 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Results (generated). The two runs behind the README headline table
-# (ns_result_baseline.json, ns_result_v3.json) are committed explicitly; all
-# other ns_eval outputs are regenerable and stay untracked.
+# Results (generated). The runs behind the headline / history tables are
+# committed explicitly: baseline (original solver), v3 (the ensemble redesign,
+# SUMMARY §4) and v4 (the trimmed shipped solver, SUMMARY §6). All other ns_eval
+# outputs are regenerable and stay untracked.
 result_*.txt
+eval_*.log
 ns_result_*.json
 !ns_result_baseline.json
 !ns_result_v3.json
+!ns_result_v4.json

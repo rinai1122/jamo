@@ -127,10 +127,12 @@ out-scores the truth). On the 100-case baseline (avg 68.1%, 47 solved):
 still decrypt to fluent, high-coverage text — just the wrong words. So the
 heavy search cannot be cheaply gated on output quality.)
 
-**Redesign.** The single gated union pass became a multi-pass ensemble applied
-across **all** lengths ≥ `min_ensemble_len` (28), not just short ones:
+**Redesign (the "v3" config).** The single gated union pass became a multi-pass
+ensemble applied across **all** lengths ≥ `min_ensemble_len` (28), not just short
+ones. (Steps 1–2 below were later found redundant by the §5 ablation and removed
+in §6; this section records the v3 pipeline that first hit 73.1%.)
 
-1. **LM-beam top-K seeds** (now K=10), each greedy-polished.
+1. **LM-beam top-K seeds** (K=10), each greedy-polished.
 2. **Base SA** seeded by beam key #1 (unchanged baseline).
 3. **Ensemble.** *Pass 1* is a **deep** anneal that reproduces the old single
    union pass byte-for-byte (same RNG, seed, budget, with `word_penalty=0`) —
@@ -148,10 +150,12 @@ across **all** lengths ≥ `min_ensemble_len` (28), not just short ones:
 | no-space solver | Avg acc | Solved ≥90% |
 |---|---|---|
 | baseline (original single deep union pass) | 68.12% | 47/100 |
-| **improved (deep+broad ensemble, all lengths)** | **73.14%** | **57/100** |
+| **v3 (deep+broad ensemble, all lengths)** | **73.14%** | **57/100** |
 
-**+5.0 pts average, +10 solved.** By length bucket the gains are exactly where
-the diagnosis predicted — the long search failures:
+**+5.0 pts average, +10 solved.** (This "v3" config was later trimmed to the
+shipped v4 in §6; the two short-case rescues below, cases 24 and 79, are the ones
+the trim gives back.) By length bucket the gains are exactly where the diagnosis
+predicted — the long search failures:
 
 | Length | Baseline | Improved | Δ avg | solved |
 |---|---|---|---|---|
@@ -180,6 +184,124 @@ pass's byte-for-byte no-regression guarantee — net not worth it, left at 0.
 *Coverage-gating* the heavy search is impossible (coverage doesn't separate the
 failure types, above).
 
+## 5. No-space ablation — which stages carry the no-space solver?
+
+`archive/ns_ablation.py` repeats the §2 ablation idea for the dedicated
+`NoSpaceSolver`: disable one stage / fitness term at a time and measure the
+accuracy cost on the **full 100-case held-out test set** (spaces stripped from
+cipher and plaintext).
+To keep nine configs × 100 cases tractable, every config shares one fixed
+*reduced* search budget (`beam_width=800, sa_restarts=6, sa_iters=1500,
+short_sa_passes=2, beam_seeds=5`), so the numbers measure **relative
+contribution**, not absolute accuracy — this ablates the full v3 pipeline (still
+with base_sa and the multi-seed beam), which at its ~2.5× larger shipped budget
+reaches 73.1% (§4). At this reduced budget the full pipeline scores
+58.8%. The no-space search is fully seeded (per-case `random.Random`), so these
+gaps are reproducible signal, not the RNG noise that §2 had to discount.
+
+| Config | Avg acc | Solved | Δ avg | Δ solved |
+|---|---|---|---|---|
+| full pipeline | 58.84% | 33/100 | — | — |
+| **−ensemble** (multi-pass union) | **48.70%** | 19 | **−10.15** | −14 |
+| −beam (LM-beam seeding) | 50.70% | 23 | −8.14 | −10 |
+| −kn (KN language model) | 51.67% | 18 | −7.18 | −15 |
+| −greedy (greedy polish) | 53.88% | 22 | −4.97 | −11 |
+| −ws (word-seg fitness term) | 54.86% | 26 | −3.98 | −7 |
+| −struct (phonotactic DFA) | 55.53% | 27 | −3.31 | −6 |
+| −base_sa (standalone SA pass) | 58.71% | 33 | −0.13 | +0 |
+| −multiseed (beam_seeds 5→1) | 59.85% | 33 | +1.00 | +0 |
+
+**Ranking & reading**
+
+1. **Ensemble — most essential (−10.2 pts, −14 solved).** The multi-pass
+   deep+broad union is the single biggest contributor, quantitatively
+   confirming the §4 redesign thesis: with word anchors gone, escaping the
+   stuck search-failure basins via independent restarts is what carries the
+   solver. It is also the most expensive stage (removing it is the *fastest*
+   config, 444 s vs 955 s) — high value, high cost, exactly where the compute
+   should go.
+2. **LM-beam seeding (−8.1) and KN language model (−7.2) — the backbone.**
+   No spaces means no word-pattern anchors, so the n-gram beam and the KN score
+   do the heavy lifting the spaced solver got from `text.split(" ")`. The KN
+   term collapses the *solved* count hardest (33→18): it is what converts a
+   near-miss key into a clean ≥90% read, even where the average barely moves.
+3. **Greedy polish (−5.0), and the two fitness add-ons ws (−4.0) and struct
+   (−3.3) — all clearly real.** This is the sharp contrast with §2, where
+   struct/ws/dict were ~0 because the beam already supplied word anchors.
+   Here every fitness term bites: on anchorless text they are the only thing
+   separating competing fluent readings, so none is redundant.
+4. **Standalone base SA — redundant (−0.13, 0 solved lost).** The ensemble's
+   pass 1 is a *deeper* anneal from the same beam-key #1 seed, so by
+   best-by-fitness it almost always dominates the shallower standalone base SA;
+   removing the separate `base_sa` stage costs essentially nothing yet still
+   bills ~145 s. It is kept only as free best-by-fitness insurance — a genuine
+   candidate to drop if the budget were tight.
+5. **Multi-seed beam (5 vs 1) — no benefit at this budget (+1.0).** Dropping to
+   a single beam seed slightly *helps* here. The extra seeds were tuned for the
+   full budget's short-case rescues (§4); at the reduced budget they mostly
+   spread the polish effort and occasionally let a higher-fitness-but-wrong key
+   win on a short fragment. Honest caveat: this stage's value is
+   budget-dependent and does not surface at the ablation budget — it is
+   validated only at the shipped budget, not re-derivable from this table.
+
+**Contrast with the spaced ablation (§2).** There, one stage dominated (beam,
+−17.7 pts) and struct / ws / dict / fallback were ~0. Here the contributions are
+*spread*: ensemble, beam and KN are each worth 7–10 pts and the fitness terms
+each worth 3–5. Stripping the word anchors doesn't merely lower the ceiling — it
+makes every remaining stage load-bearing, because no single one can pin the key
+on its own. That spread is the quantitative signature of the no-space regime.
+
+The two ~0 / positive rows — `base_sa` (−0.13) and `multiseed` (+1.0) — flagged
+removable stages; §6 acts on that and re-validates at the shipped budget.
+
+## 6. Trimming to the shipped solver (v4)
+
+§5 found the standalone base-SA pass fully redundant (the ensemble's deep pass 1
+supersedes it) and the multi-seed beam not earning its budget. Both were removed
+from `NoSpaceSolver`, which is now simply **single best beam key → greedy polish
+→ deep+broad annealing ensemble** (gone: `base_sa`, `beam_seeds`,
+`union_seed_all`; ~40 lines and three knobs lighter). The result was re-validated
+on the **full 100-case held-out test set at the shipped budget** (`ns_eval.py`,
+→ `ns_result_v4.json`):
+
+| no-space solver | Avg acc | Solved ≥90% | vs baseline |
+|---|---|---|---|
+| baseline (original single deep union pass) | 68.12% | 47/100 | — |
+| v3 (ensemble + multi-seed beam + base SA, §4) | 73.14% | 57/100 | +5.02 / +10 |
+| **v4 (trimmed, shipped)** | **72.38%** | **54/100** | **+4.26 / +7** |
+
+**The trim is not free, and the ablation budget hid the cost.** Dropping base_sa
+was free as predicted (it never won a case the ensemble didn't). Dropping the
+multi-seed beam cost **−0.75 pts / −3 solved vs v3**, and the loss is entirely in
+the short/mid buckets — exactly the §4 short-case rescues the extra seeds bought:
+
+| Length | v3 | v4 | Δ avg | v3→v4 solved |
+|---|---|---|---|---|
+| <30   | 38.2% | 32.8% | −5.3 | 0→0 |
+| 30–44 | 62.0% | 58.0% | −4.0 | 11→8 |
+| 45–59 | 68.4% | 73.6% | +5.2 | 9→9 |
+| 60–94 | 93.6% | 94.2% | +0.6 | 18→17 |
+| 95+   | 97.6% | 99.1% | +1.6 | 19→20 |
+
+The casualties are the two v3 headline rescues that depended on a lower-ranked
+beam seed: case 24 (36j) **91.7%→0%** and case 79 (44j) **95.5%→11.4%** both flip
+back to wrong basins the single best key can't escape. This refines §5's
+multiseed reading: at the *reduced* ablation budget the extra seeds looked inert
+(+1.0), but at the *shipped* budget — where the ensemble has the depth to exploit
+a near-miss seed — they genuinely rescue a few short cases. The reduced-budget
+ablation under-counted them, the documented risk of measuring relative
+contribution at a smaller budget.
+
+**Why ship v4 anyway.** The entire long-case story — the whole point of the
+redesign — is untouched: vs the baseline, v4 still gains **+9.9 pts (60–94j)** and
+**+11.2 pts (95+j)**, and every long rescue survives (case 67 105j 3.8%→99%,
+case 95 132j 13.6%→99.2%, case 62 83j 8.4%→92.8%, case 23 84j 67.9%→100%). The
+trade is a meaningfully simpler, faster solver (one beam seed, one fewer SA pass)
+for −0.75 pt on the already-hard, partly-irreducible short fragments. Net vs the
+original baseline is **+4.3 pts / +7 solved**, and the failure split is unchanged
+(46 unsolved: 19 search, 27 objective). v3's outputs remain committed
+(`ns_result_v3.json`) so the trade-off is auditable per case.
+
 ## Code change
 
 `crack.py`: `KneserNeyScorer` now caps its n-gram cache (`_cache_cap`,
@@ -189,10 +311,17 @@ optional `disable` set (names: `kn`, `struct`, `dict`, `beam`, `edge`,
 `sa_fallback`, `sa_polish`, `greedy`) and `pattern_map_cache` path argument for
 the ablation in §2.
 
-`nospace_solver.py`: prefix-pruned word-segmentation DP; multi-pass deep+broad
-ensemble (`short_sa_passes`, `short_iter_mult`, `min_ensemble_len`,
-`union_seed_all`); inert `word_penalty` hook. Defaults are the validated config.
+`nospace_solver.py`: prefix-pruned word-segmentation DP; single best beam key →
+greedy polish → multi-pass deep+broad annealing ensemble (`short_sa_passes`,
+`short_iter_mult`, `min_ensemble_len`); inert `word_penalty` hook; a `disable`
+set (names: `kn`, `struct`, `ws`, `beam`, `greedy`, `ensemble`) switching off
+one stage or fitness term at a time for the §5 ablation. The standalone base-SA
+pass and the multi-seed beam (`beam_seeds`, `union_seed_all`) were **removed**
+after §5 (see §6); defaults are the trimmed shipped config.
 
 New harness/analysis scripts: `ns_eval.py` (parallel full-benchmark eval with
 search/objective diagnostics + saved outputs), `ns_compare_results.py` (before/
-after diff by bucket), `ns_objsweep.py` (offline objective tuning).
+after diff by bucket), `ns_objsweep.py` (offline objective tuning). The
+per-stage no-space ablation `ns_ablation.py` (+ `ns_ablation.json`, §5) now lives
+under `archive/`: it exercises the removed `base_sa`/`beam_seeds` knobs, so it is
+frozen as the record of that decision.
